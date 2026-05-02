@@ -1,0 +1,8 @@
+{
+  "name": "AeroX SaaS",
+  "description": "Premium AI image generation platform with natural language editing, professional controls, and high-fidelity output inspired by Reve.IA.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}

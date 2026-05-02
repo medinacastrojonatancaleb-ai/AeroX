@@ -1,0 +1,65 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // --- Entities Validation ---
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email']) 
+        && data.uid == request.auth.uid
+        && data.email is string && data.email.size() <= 200
+        && (data.get('displayName', null) == null || (data.displayName is string && data.displayName.size() <= 200))
+        && (data.get('photoURL', null) == null || (data.photoURL is string && data.photoURL.size() <= 1000))
+        && (data.get('theme', 'dark') in ['dark', 'light'])
+        && (data.get('defaultFormat', '9:16') is string)
+        && (data.get('defaultQuality', 'Alta') is string)
+        && (data.get('defaultStyle', 'Cinemático') is string)
+        && (data.get('updatedAt', '') is string);
+    }
+
+    function isValidHistory(data) {
+      return data.keys().hasAll(['id', 'url', 'prompt', 'timestamp'])
+        && data.id is string && data.id.size() <= 128
+        && data.url is string && data.url.size() <= 1048576 // Document limit is 1MB
+        && data.prompt is string && data.prompt.size() <= 5000
+        && data.timestamp is number
+        && (!('settings' in data) || data.settings is map);
+    }
+
+    // --- Rules ---
+
+    match /users/{userId} {
+      allow get: if isOwner(userId);
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'displayName', 'photoURL', 'theme', 'defaultFormat', 'defaultQuality', 'defaultStyle', 'updatedAt'
+        ]);
+      
+      match /history/{imageId} {
+        allow list: if isOwner(userId);
+        allow get: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidHistory(request.resource.data);
+        allow delete: if isOwner(userId);
+      }
+    }
+  }
+}
