@@ -284,7 +284,21 @@ export default function App() {
     if (!promptText.trim() || isGenerating) return;
 
     setIsGenerating(true);
-    const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
+    
+    // Safety check for API Key - useful for external deployments like Vercel
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        error: "ERROR DE CONFIGURACIÓN: La API Key de Gemini no está configurada. Si estás en Vercel, asegúrate de añadir GEMINI_API_KEY en las variables de entorno.",
+        timestamp: Date.now()
+      }]);
+      setIsGenerating(false);
+      return;
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
     let finalPrompt = promptText;
 
     try {
@@ -298,31 +312,29 @@ export default function App() {
           Analiza la petición y responde en formato JSON:
           {
             "intent": "GENERATE" | "CONVERSE" | "UNSUPPORTED",
+            "explanation": "Breve motivo del intent para logs",
             "message": "Tu respuesta conversacional si el intent es CONVERSE o UNSUPPORTED",
-            "optimizedPrompt": "El prompt optimizado en INGLÉS para la IA de imagen si el intent es GENERATE"
+            "optimizedPrompt": "El prompt optimizado en INGLÉS para la IA de imagen si el intent es GENERATE ("high quality cinema style 8k" etc)"
           }
 
           Reglas:
-          - Si pide un video, audio o archivo complejo: UNSUPPORTED. Explica que solo haces imágenes pero sé amable.
-          - Si solo saluda, hace una pregunta o charla: CONVERSE. Responde con naturalidad y pasión artística.
-          - Si pide crear o cambiar una imagen: GENERATE. No des explicaciones, solo pon el prompt en optimizedPrompt.
-          
-          Devuelve solo el JSON válido.` }] }]
+          - Si pide un video, audio o archivo: UNSUPPORTED. Explica amablemente que solo haces imágenes.
+          - Si solo saluda, hace preguntas o charla informal: CONVERSE. Responde con pasión artística.
+          - Si pide crear o cambiar una imagen: GENERATE. El prompt debe ser en INGLÉS.
+          - Devuelve SOLO el JSON, sin bloques de código.` }] }]
         });
         
         try {
           const rawText = conversationManager.text?.trim() || "{}";
-          // Basic cleanup in case the model adds markdown code blocks
-          const jsonText = rawText.startsWith('```') ? rawText.replace(/^```json\n|```$/g, '') : rawText;
+          // Advanced cleanup for model hallucinations
+          const jsonText = rawText.replace(/```json|```/g, "").trim();
           const analysis = JSON.parse(jsonText);
 
           if (analysis.intent === 'CONVERSE' || analysis.intent === 'UNSUPPORTED') {
             setMessages(prev => [...prev, {
               id: Date.now().toString(),
               role: 'assistant',
-              content: analysis.message || (analysis.intent === 'UNSUPPORTED' 
-                ? "Por ahora solo puedo crear imágenes estáticas de gran calidad. ¿Te gustaría que visualice esa idea en una ilustración?" 
-                : "¡Hola! Soy tu asistente creativo. ¿Qué tienes en mente para hoy?"),
+              content: analysis.message || "Entiendo tu idea. ¿Te gustaría que la visualicemos en una imagen artística?",
               timestamp: Date.now()
             }]);
             setIsGenerating(false);
@@ -331,12 +343,13 @@ export default function App() {
           
           if (analysis.intent === 'GENERATE' && analysis.optimizedPrompt) {
             finalPrompt = analysis.optimizedPrompt;
+            console.log("Prompt optimizado por IA:", finalPrompt);
           }
         } catch (parseError) {
-          console.warn("Fallo el parseo del análisis, usando prompt directo:", parseError);
+          console.warn("Fallo el análisis inteligente, continuando con prompt original:", parseError);
         }
       } catch (e) {
-        console.warn("Fallo en intent guard, procediendo con precaución:", e);
+        console.warn("Error en el pre-procesamiento del prompt:", e);
       }
 
       // If we reach here, we are generating an image (either via analysis or fallback)
@@ -403,21 +416,21 @@ export default function App() {
             const sizeInBytes = new Blob([serialized]).size;
             
             // If image is too large, compress it for cloud storage
-            // This ensures history always has a preview
+            // This ensures history always has a preview (~900KB safety margin)
             if (sizeInBytes >= 900000) {
-              console.log(`Comprimiendo imagen ${res.id} para la nube...`);
-              const compressedUrl = await compressImage(res.url);
+              console.log(`Optimizando tamaño para Firestore (${res.id})...`);
+              const compressedUrl = await compressImage(res.url, 700); 
               const compressedRes = { ...res, url: compressedUrl };
               await setDoc(doc(db, 'users', user.uid, 'history', res.id), compressedRes);
             } else {
               await setDoc(doc(db, 'users', user.uid, 'history', res.id), res);
             }
           } catch (e: any) {
-            console.error("Error al guardar en historial:", e);
+            console.error("Fallo guardado en la nube:", e);
+            // Non-blocking error: save at least the prompt and a placeholder
             if (e.message?.includes('exceeds the maximum allowed size') || e.code === 'permission-denied') {
-               const lowResUrl = await compressImage(res.url, 200); // Super compression as fall-back
-               const promptOnlyRes = { ...res, url: lowResUrl };
-               await setDoc(doc(db, 'users', user.uid, 'history', res.id), promptOnlyRes).catch(() => {});
+               const ultraCompressed = await compressImage(res.url, 150).catch(() => "error_size");
+               await setDoc(doc(db, 'users', user.uid, 'history', res.id), { ...res, url: ultraCompressed }).catch(() => {});
             }
           }
         }
@@ -455,14 +468,20 @@ export default function App() {
     if (!chatInput.trim() || isGenerating) return;
     setIsGenerating(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY as string });
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) throw new Error("API Key missing");
+      
+      const ai = new GoogleGenAI({ apiKey });
       const response = await ai.models.generateContent({
         model: "gemini-3-flash-preview",
-        contents: [{ role: 'user', parts: [{ text: `Optimiza este prompt para un modelo de IA de imagen. Hazlo visualmente descriptivo, profesional y cinematográfico. Devuelve solo el prompt optimizado en inglés. Idea: "${chatInput}"` }] }]
+        contents: [{ role: 'user', parts: [{ text: `Eres un experto en ingeniería de prompts para IA de imagen (Stable Diffusion/DALL-E). 
+        Optimiza este prompt para que sea hiper-detallado, artístico y profesional. 
+        Devuelve SOLO el nuevo prompt en inglés.
+        Idea: "${chatInput}"` }] }]
       });
       setChatInput(response.text || chatInput);
     } catch (e) {
-      console.error(e);
+      console.error("Optimization failed", e);
     } finally {
       setIsGenerating(false);
     }
@@ -760,7 +779,17 @@ export default function App() {
                   className="w-full h-full grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 md:gap-8 p-8 overflow-y-auto no-scrollbar"
                 >
                   {history.map((img) => (
-                    <HistoryCard key={img.id} image={img} theme={theme} onClick={() => { setSelectedResult([img]); setActiveTab('create'); }} />
+                    <HistoryCard 
+                      key={img.id} 
+                      image={img} 
+                      theme={theme} 
+                      onClick={() => { setSelectedResult([img]); setActiveTab('create'); }} 
+                      onDelete={async (id) => {
+                        if (user && confirm("¿Estás seguro de que quieres eliminar esta imagen de tu historial?")) {
+                          await deleteDoc(doc(db, 'users', user.uid, 'history', id)).catch(e => console.error(e));
+                        }
+                      }}
+                    />
                   ))}
                   {history.length === 0 && (
                     <div className="col-span-full flex flex-col items-center justify-center text-zinc-600 gap-4 opacity-50 h-full text-center">
@@ -982,7 +1011,7 @@ function ControlCard({ label, options, value, onChange, theme = 'dark' }: { labe
   );
 }
 
-function HistoryCard({ image, onClick, theme = 'dark' }: { image: ImageResult; onClick: () => void; theme?: 'dark' | 'light' }) {
+function HistoryCard({ image, onClick, onDelete, theme = 'dark' }: { image: ImageResult; onClick: () => void; onDelete: (id: string) => void; theme?: 'dark' | 'light' }) {
   return (
     <motion.div 
       initial={{ opacity: 0, scale: 0.95 }} 
@@ -994,11 +1023,20 @@ function HistoryCard({ image, onClick, theme = 'dark' }: { image: ImageResult; o
         theme === 'dark' ? "bg-[#0c0c0c] border-white/5 ring-white/5" : "bg-white border-black/5 ring-black/5 shadow-black/5"
       )}
     >
-      <img src={image.url} className="w-full h-full object-cover transition-transform duration-1000 group-hover:scale-110" />
-      <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-6 backdrop-blur-[2px]">
+      <img src={image.url} className="w-full h-full object-cover transition-transform duration-1000 group-hover:scale-110" loading="lazy" />
+      
+      {/* Delete Overlay Button */}
+      <button 
+        onClick={(e) => { e.stopPropagation(); onDelete(image.id); }}
+        className="absolute top-4 right-4 p-2 bg-red-500/80 hover:bg-red-500 text-white rounded-xl opacity-0 group-hover:opacity-100 transition-all scale-75 group-hover:scale-100 shadow-xl"
+      >
+        <Trash2 size={16} />
+      </button>
+
+      <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-6 backdrop-blur-[2px] pointer-events-none">
          <div className="flex items-center gap-2 mb-2">
-            <span className="px-2 py-0.5 bg-white/10 rounded-full text-[8px] font-black uppercase tracking-widest text-white/70">{image.settings.style}</span>
-            <span className="px-2 py-0.5 bg-white/10 rounded-full text-[8px] font-black uppercase tracking-widest text-white/70">{image.settings.format}</span>
+            <span className="px-2 py-0.5 bg-white/10 rounded-full text-[8px] font-black uppercase tracking-widest text-white/70">{image.settings?.style || 'Standard'}</span>
+            <span className="px-2 py-0.5 bg-white/10 rounded-full text-[8px] font-black uppercase tracking-widest text-white/70">{image.settings?.format || '1:1'}</span>
          </div>
          <p className="text-[12px] text-zinc-100 line-clamp-2 leading-relaxed font-medium">{image.prompt}</p>
       </div>
