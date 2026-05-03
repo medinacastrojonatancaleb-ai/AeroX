@@ -41,7 +41,6 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn } from './lib/utils';
-import { GoogleGenAI } from "@google/genai";
 import { 
   auth, 
   db, 
@@ -237,19 +236,25 @@ export default function App() {
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (e: any) {
-      console.error("Login failed", e);
+      console.error("Login failed details:", e);
+      let errorMsg = "Error al iniciar sesión. Inténtalo de nuevo.";
+      
       if (e.code === 'auth/popup-blocked') {
-        alert("El navegador bloqueó la ventana de inicio de sesión. Por favor, permite las ventanas emergentes.");
+        errorMsg = "El navegador bloqueó la ventana de inicio de sesión. Por favor, permite las ventanas emergentes.";
       } else if (e.code === 'auth/cancelled-popup-request') {
-        // Safe to ignore, user closed or another request started
-      } else {
-        setMessages(prev => [...prev, {
-          id: Date.now().toString(),
-          role: 'assistant',
-          error: "Error al iniciar sesión. Inténtalo de nuevo.",
-          timestamp: Date.now()
-        }]);
+        return; // Ignore
+      } else if (e.code === 'auth/unauthorized-domain') {
+        errorMsg = `Error de dominio: Este dominio (${window.location.hostname}) no está autorizado en Firebase Console (Authentication -> Settings -> Authorized domains).`;
+      } else if (e.message) {
+        errorMsg = `Error: ${e.message}`;
       }
+      
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        role: 'assistant',
+        error: errorMsg,
+        timestamp: Date.now()
+      }]);
     } finally {
       setIsLoggingIn(false);
     }
@@ -284,51 +289,19 @@ export default function App() {
     if (!promptText.trim() || isGenerating) return;
 
     setIsGenerating(true);
-    
-    // Safety check for API Key - useful for external deployments like Vercel
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      setMessages(prev => [...prev, {
-        id: Date.now().toString(),
-        role: 'assistant',
-        error: "ERROR DE CONFIGURACIÓN: La API Key de Gemini no está configurada. Si estás en Vercel, asegúrate de añadir GEMINI_API_KEY en las variables de entorno.",
-        timestamp: Date.now()
-      }]);
-      setIsGenerating(false);
-      return;
-    }
-
-    const ai = new GoogleGenAI({ apiKey });
     let finalPrompt = promptText;
 
     try {
-      // Improved Intent Guard: Smart classifier + conversational response
+      // Intent analysis via server proxy
       try {
-        const conversationManager = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: [{ role: 'user', parts: [{ text: `Eres un asistente creativo experto en generación de imágenes artísticas. 
-          Petición del usuario: "${promptText}"
-
-          Analiza la petición y responde en formato JSON:
-          {
-            "intent": "GENERATE" | "CONVERSE" | "UNSUPPORTED",
-            "explanation": "Breve motivo del intent para logs",
-            "message": "Tu respuesta conversacional si el intent es CONVERSE o UNSUPPORTED",
-            "optimizedPrompt": "El prompt optimizado en INGLÉS para la IA de imagen si el intent es GENERATE ("high quality cinema style 8k" etc)"
-          }
-
-          Reglas:
-          - Si pide un video, audio o archivo: UNSUPPORTED. Explica amablemente que solo haces imágenes.
-          - Si solo saluda, hace preguntas o charla informal: CONVERSE. Responde con pasión artística.
-          - Si pide crear o cambiar una imagen: GENERATE. El prompt debe ser en INGLÉS.
-          - Devuelve SOLO el JSON, sin bloques de código.` }] }]
+        const response = await fetch('/api/analyze-intent', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prompt: promptText })
         });
         
-        try {
-          const rawText = conversationManager.text?.trim() || "{}";
-          // Advanced cleanup for model hallucinations
-          const jsonText = rawText.replace(/```json|```/g, "").trim();
-          const analysis = JSON.parse(jsonText);
+        if (response.ok) {
+          const analysis = await response.json();
 
           if (analysis.intent === 'CONVERSE' || analysis.intent === 'UNSUPPORTED') {
             setMessages(prev => [...prev, {
@@ -345,56 +318,44 @@ export default function App() {
             finalPrompt = analysis.optimizedPrompt;
             console.log("Prompt optimizado por IA:", finalPrompt);
           }
-        } catch (parseError) {
-          console.warn("Fallo el análisis inteligente, continuando con prompt original:", parseError);
         }
-      } catch (e) {
-        console.warn("Error en el pre-procesamiento del prompt:", e);
+      } catch (parseError) {
+        console.warn("Fallo el análisis inteligente, continuando con prompt original:", parseError);
       }
 
-      // If we reach here, we are generating an image (either via analysis or fallback)
-      
-      // Generate images sequentially to avoid rate limits and handle partial failures better
+      // If we reach here, we are generating an image
+      // Note: We use the server-side proxy for all Gemini calls now to protect the API key
       const generatedImages: ImageResult[] = [];
       const errors: string[] = [];
 
       for (let i = 0; i < count; i++) {
         try {
           console.log(`Generando imagen ${i + 1} de ${count}...`);
-          const result = await ai.models.generateContent({
-            model: 'gemini-2.5-flash-image',
-            contents: [{ parts: [{ text: `${finalPrompt}, ${style} style, high quality, professional photography` }] }],
-            config: {
-              imageConfig: {
-                aspectRatio: format as any,
-              }
-            }
+          const response = await fetch('/api/generate-image', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ 
+              prompt: finalPrompt, 
+              aspectRatio: format, 
+              style: style 
+            })
           });
 
-          const candidate = result.candidates?.[0];
-          if (!candidate) throw new Error("El servicio de IA no devolvió candidatos.");
-
-          if (candidate.finishReason === 'SAFETY') {
-            errors.push("Imagen bloqueada por filtros de seguridad de la IA.");
-            continue;
+          if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.error || `Error del servidor: ${response.status}`);
           }
 
-          const part = candidate.content?.parts?.find(p => p.inlineData);
-          if (!part?.inlineData?.data) {
-            console.error("Respuesta sin datos binarios:", candidate);
-            errors.push("El modelo no devolvió datos de imagen.");
-            continue;
-          }
+          const data = await response.json();
 
           generatedImages.push({
             id: generateId(),
-            url: `data:image/png;base64,${part.inlineData.data}`,
+            url: data.url,
             prompt: finalPrompt,
             settings: { format, quality, style, count },
             timestamp: Date.now()
           });
           
-          // Small delay to prevent hitting rapid-fire limits
           if (count > 1 && i < count - 1) {
             await new Promise(resolve => setTimeout(resolve, 300));
           }
@@ -468,18 +429,18 @@ export default function App() {
     if (!chatInput.trim() || isGenerating) return;
     setIsGenerating(true);
     try {
-      const apiKey = process.env.GEMINI_API_KEY;
-      if (!apiKey) throw new Error("API Key missing");
-      
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [{ role: 'user', parts: [{ text: `Eres un experto en ingeniería de prompts para IA de imagen (Stable Diffusion/DALL-E). 
-        Optimiza este prompt para que sea hiper-detallado, artístico y profesional. 
-        Devuelve SOLO el nuevo prompt en inglés.
-        Idea: "${chatInput}"` }] }]
+      const response = await fetch('/api/optimize-prompt', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ prompt: chatInput })
       });
-      setChatInput(response.text || chatInput);
+      
+      if (response.ok) {
+        const data = await response.json();
+        setChatInput(data.optimized || chatInput);
+      } else {
+        console.warn("Server optimization failed");
+      }
     } catch (e) {
       console.error("Optimization failed", e);
     } finally {
